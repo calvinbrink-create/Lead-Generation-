@@ -40,6 +40,9 @@ AUDIT_METHOD = os.environ.get("AUDIT_METHOD", "POST").upper()
 AUDIT_FIELD = os.environ.get("AUDIT_FIELD", "url")
 AUDIT_NAME_FIELD = os.environ.get("AUDIT_NAME_FIELD", "business")
 AUDIT_TIMEOUT = int(os.environ.get("AUDIT_TIMEOUT", "90"))
+# Discovery uses a short timeout: probing 36 combinations at the full timeout
+# would take the better part of an hour for a single lead.
+PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "8"))
 AUDIT_POLL_SECONDS = int(os.environ.get("AUDIT_POLL_SECONDS", "5"))
 AUDIT_POLL_ATTEMPTS = int(os.environ.get("AUDIT_POLL_ATTEMPTS", "12"))
 
@@ -437,19 +440,20 @@ def _extract_pdf_link(data):
     return None
 
 
-def _try_once(method, url, field, website, business, session):
+def _try_once(method, url, field, website, business, session, timeout=None):
     payload = {field: website}
     if AUDIT_NAME_FIELD:
         payload[AUDIT_NAME_FIELD] = business
     headers = {"Accept": "application/pdf, application/json;q=0.9, */*;q=0.5",
                "User-Agent": "GrowthSupplyHouse-AuditBot/1.0"}
+    t = timeout or AUDIT_TIMEOUT
 
     if method == "GET":
-        r = session.get(url, params=payload, headers=headers, timeout=AUDIT_TIMEOUT)
+        r = session.get(url, params=payload, headers=headers, timeout=t)
     else:
-        r = session.post(url, json=payload, headers=headers, timeout=AUDIT_TIMEOUT)
+        r = session.post(url, json=payload, headers=headers, timeout=t)
         if r.status_code in (400, 415, 422):      # some services want form encoding
-            r = session.post(url, data=payload, headers=headers, timeout=AUDIT_TIMEOUT)
+            r = session.post(url, data=payload, headers=headers, timeout=t)
     if r.status_code >= 400:
         return None, f"HTTP {r.status_code}"
     if _looks_like_pdf(r):
@@ -595,18 +599,29 @@ def _click_submit(page, field):
     field.press("Enter")
 
 
+# Set once a run has established there is no usable HTTP endpoint, so later
+# leads in the same run go straight to the browser instead of re-probing.
+_HTTP_PROBE_EXHAUSTED = False
+
+
 def fetch_audit(website, business, conn=None):
     """Return PDF bytes for one site, discovering the endpoint if needed."""
+    global _HTTP_PROBE_EXHAUSTED
     session = requests.Session()
     tried = []
 
     cached = get_cached_endpoint(conn) if conn is not None else None
-    order = [cached] if cached else []
-    order += [c for c in _candidates() if c != cached]
 
-    for method, url, field in order:
+    if cached:
+        order = [(cached, AUDIT_TIMEOUT)]
+    elif _HTTP_PROBE_EXHAUSTED:
+        order = []                      # already proved there is nothing to find
+    else:
+        order = [(c, PROBE_TIMEOUT) for c in _candidates()]
+
+    for (method, url, field), timeout in order:
         try:
-            pdf, how = _try_once(method, url, field, website, business, session)
+            pdf, how = _try_once(method, url, field, website, business, session, timeout)
         except Exception as e:
             tried.append(f"{method} {url} [{field}] -> {type(e).__name__}")
             continue
@@ -617,7 +632,11 @@ def fetch_audit(website, business, conn=None):
             return pdf
         tried.append(f"{method} {url} [{field}] -> {how}")
         if cached and (method, url, field) == cached:
-            log("           cached endpoint stopped working, re-probing")
+            log("           cached endpoint stopped working, re-probing next run")
+
+    if not cached and order:
+        _HTTP_PROBE_EXHAUSTED = True
+        log("           no HTTP endpoint answered; using the browser from here on")
 
     if os.environ.get("AUDIT_NO_BROWSER") != "1":
         try:
