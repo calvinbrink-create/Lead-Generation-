@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: daily-leadgen
+  cancel-in-progress: false
+
 jobs:
   generate-leads:
     runs-on: ubuntu-latest
