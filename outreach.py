@@ -14,13 +14,11 @@ contacted or opted out. Sending is a dry run unless OUTREACH_LIVE=1.
 """
 
 import argparse
-import mimetypes
 import os
 import re
 import smtplib
 import sqlite3
 import ssl
-import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -37,10 +35,7 @@ AUDIT_DIR = Path("audits")
 MASTER_XLSX = OUTPUT_DIR / "leads_master.xlsx"
 
 # --- audit tool -------------------------------------------------------------
-# The endpoint is configurable so the exact shape of the audit service can be
-# set without editing code. AUDIT_METHOD is GET or POST; AUDIT_FIELD is the
-# parameter carrying the website being audited.
-AUDIT_ENDPOINT = os.environ.get("AUDIT_ENDPOINT", "https://audit.growthsupplyhouse.com/api/audit")
+AUDIT_ENDPOINT = os.environ.get("AUDIT_ENDPOINT", "")
 AUDIT_METHOD = os.environ.get("AUDIT_METHOD", "POST").upper()
 AUDIT_FIELD = os.environ.get("AUDIT_FIELD", "url")
 AUDIT_NAME_FIELD = os.environ.get("AUDIT_NAME_FIELD", "business")
@@ -114,6 +109,9 @@ def init_db():
         email     TEXT,
         domain    TEXT,
         sent_at   TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY, value TEXT
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_send_log_day ON send_log(day)")
     conn.commit()
@@ -343,74 +341,135 @@ def _looks_like_pdf(resp):
     return "pdf" in ctype or resp.content[:5] == b"%PDF-"
 
 
-def fetch_audit(website, business):
-    """Run one site through the audit tool and return PDF bytes.
+AUDIT_BASE = os.environ.get("AUDIT_BASE", "https://audit.growthsupplyhouse.com").rstrip("/")
 
-    Handles the three shapes an audit service normally takes: the PDF straight
-    back in the response, a JSON body carrying a link to it, or a job that has
-    to be polled. Endpoint and field names come from env vars so the exact
-    contract can be set without a code change.
-    """
-    payload = {AUDIT_FIELD: website}
+# The audit service's exact contract is not documented here, so instead of
+# hard-coding one guess we probe a short list of the shapes such a tool
+# normally takes, then remember whichever one worked.
+AUDIT_PATHS = ("/api/audit", "/api/generate", "/api/report", "/audit", "/generate", "/")
+AUDIT_FIELDS = ("url", "website", "site", "domain", "target", "targetUrl")
+
+
+def _candidates():
+    """Explicit config first; otherwise probe. Ordered most-likely first."""
+    if AUDIT_ENDPOINT:
+        yield (AUDIT_METHOD, AUDIT_ENDPOINT, AUDIT_FIELD)
+        return
+    for path in AUDIT_PATHS:
+        for field in AUDIT_FIELDS[:3]:
+            yield ("POST", AUDIT_BASE + path, field)
+    for path in AUDIT_PATHS:
+        for field in AUDIT_FIELDS[:3]:
+            yield ("GET", AUDIT_BASE + path, field)
+
+
+def get_cached_endpoint(conn):
+    row = conn.execute("SELECT value FROM config WHERE key='audit_endpoint'").fetchone()
+    return tuple(row[0].split("|")) if row else None
+
+
+def cache_endpoint(conn, method, url, field):
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES ('audit_endpoint', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (f"{method}|{url}|{field}",),
+    )
+    conn.commit()
+
+
+def _extract_pdf_link(data):
+    if not isinstance(data, dict):
+        return None
+    for key in ("pdf_url", "pdfUrl", "url", "download_url", "downloadUrl",
+                "report_url", "reportUrl", "file", "link", "pdf", "result"):
+        val = data.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+    for val in data.values():
+        if isinstance(val, dict):
+            found = _extract_pdf_link(val)
+            if found:
+                return found
+    return None
+
+
+def _try_once(method, url, field, website, business, session):
+    payload = {field: website}
     if AUDIT_NAME_FIELD:
         payload[AUDIT_NAME_FIELD] = business
-    headers = {"Accept": "application/pdf, application/json;q=0.9, */*;q=0.5"}
+    headers = {"Accept": "application/pdf, application/json;q=0.9, */*;q=0.5",
+               "User-Agent": "GrowthSupplyHouse-AuditBot/1.0"}
 
-    if AUDIT_METHOD == "GET":
-        r = requests.get(AUDIT_ENDPOINT, params=payload, headers=headers, timeout=AUDIT_TIMEOUT)
+    if method == "GET":
+        r = session.get(url, params=payload, headers=headers, timeout=AUDIT_TIMEOUT)
     else:
-        r = requests.post(AUDIT_ENDPOINT, json=payload, headers=headers, timeout=AUDIT_TIMEOUT)
-    r.raise_for_status()
-
+        r = session.post(url, json=payload, headers=headers, timeout=AUDIT_TIMEOUT)
+        if r.status_code in (400, 415, 422):      # some services want form encoding
+            r = session.post(url, data=payload, headers=headers, timeout=AUDIT_TIMEOUT)
+    if r.status_code >= 400:
+        return None, f"HTTP {r.status_code}"
     if _looks_like_pdf(r):
-        return r.content
+        return r.content, "pdf"
 
-    # JSON: either a direct link, or a job to poll.
     try:
         data = r.json()
     except ValueError:
-        raise RuntimeError(
-            f"audit endpoint returned {r.headers.get('content-type', 'unknown')} "
-            f"({len(r.content)} bytes), neither PDF nor JSON"
-        )
+        return None, f"non-JSON {r.headers.get('content-type', '?')}"
 
-    link = None
-    for key in ("pdf_url", "pdfUrl", "url", "download_url", "downloadUrl",
-                "report_url", "reportUrl", "file", "link", "result"):
-        val = data.get(key) if isinstance(data, dict) else None
-        if isinstance(val, str) and val.startswith("http"):
-            link = val
-            break
-
-    if link is None and isinstance(data, dict):
+    link = _extract_pdf_link(data)
+    if not link and isinstance(data, dict):
         job = data.get("id") or data.get("job_id") or data.get("jobId")
         status_url = data.get("status_url") or data.get("statusUrl")
         if job or status_url:
-            poll = status_url or urllib.parse.urljoin(AUDIT_ENDPOINT.rstrip("/") + "/", str(job))
+            poll = status_url or f"{url.rstrip('/')}/{job}"
             for _ in range(AUDIT_POLL_ATTEMPTS):
                 time.sleep(AUDIT_POLL_SECONDS)
-                pr = requests.get(poll, headers=headers, timeout=AUDIT_TIMEOUT)
+                pr = session.get(poll, headers=headers, timeout=AUDIT_TIMEOUT)
                 if _looks_like_pdf(pr):
-                    return pr.content
+                    return pr.content, "pdf (polled)"
                 try:
-                    pdata = pr.json()
+                    link = _extract_pdf_link(pr.json())
                 except ValueError:
                     continue
-                for key in ("pdf_url", "pdfUrl", "url", "download_url", "reportUrl"):
-                    if isinstance(pdata.get(key), str) and pdata[key].startswith("http"):
-                        link = pdata[key]
-                        break
                 if link:
                     break
-
     if not link:
-        raise RuntimeError(f"no PDF or PDF link in audit response: {str(data)[:200]}")
+        return None, f"no PDF link in {str(data)[:120]}"
 
-    pr = requests.get(link, headers=headers, timeout=AUDIT_TIMEOUT)
-    pr.raise_for_status()
+    pr = session.get(link, headers=headers, timeout=AUDIT_TIMEOUT)
     if not _looks_like_pdf(pr):
-        raise RuntimeError(f"audit link {link} did not return a PDF")
-    return pr.content
+        return None, f"link {link} was not a PDF"
+    return pr.content, "pdf (linked)"
+
+
+def fetch_audit(website, business, conn=None):
+    """Return PDF bytes for one site, discovering the endpoint if needed."""
+    session = requests.Session()
+    tried = []
+
+    cached = get_cached_endpoint(conn) if conn is not None else None
+    order = [cached] if cached else []
+    order += [c for c in _candidates() if c != cached]
+
+    for method, url, field in order:
+        try:
+            pdf, how = _try_once(method, url, field, website, business, session)
+        except Exception as e:
+            tried.append(f"{method} {url} [{field}] -> {type(e).__name__}")
+            continue
+        if pdf:
+            if conn is not None and (method, url, field) != cached:
+                cache_endpoint(conn, method, url, field)
+                log(f"           audit endpoint locked in: {method} {url} ({field}, {how})")
+            return pdf
+        tried.append(f"{method} {url} [{field}] -> {how}")
+        if cached and (method, url, field) == cached:
+            log("           cached endpoint stopped working, re-probing")
+
+    raise RuntimeError(
+        "no audit endpoint returned a PDF. Tried:\n            "
+        + "\n            ".join(tried[:10])
+    )
 
 
 def run_audits(conn, leads, headers, ws, limit):
@@ -444,7 +503,7 @@ def run_audits(conn, leads, headers, ws, limit):
 
         log(f"  [audit] {lead.domain} ...")
         try:
-            pdf = fetch_audit(lead.website or f"https://{lead.domain}", lead.business)
+            pdf = fetch_audit(lead.website or f"https://{lead.domain}", lead.business, conn)
             path.write_bytes(pdf)
             ok, detail = verify_pdf(path)
             if not ok:
@@ -520,6 +579,33 @@ Growth Supply House
     return subject, body
 
 
+def _deliver(msg):
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
+        s.ehlo()
+        s.starttls(context=ctx)
+        s.login(SMTP_USER, SMTP_PASS)
+        s.send_message(msg)
+    return msg["Message-ID"] or ""
+
+
+def send_report(to_addr, subject, body, attachment):
+    """Send the spreadsheet to the operator - no outreach gating applies."""
+    msg = EmailMessage()
+    msg["From"] = f"{FROM_NAME} <{SMTP_USER}>"
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    data = Path(attachment).read_bytes()
+    msg.add_attachment(
+        data,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=Path(attachment).name,
+    )
+    return _deliver(msg)
+
+
 def send_email(to_addr, subject, body, attachment):
     msg = EmailMessage()
     msg["From"] = f"{FROM_NAME} <{SMTP_USER}>"
@@ -533,14 +619,7 @@ def send_email(to_addr, subject, body, attachment):
     data = Path(attachment).read_bytes()
     msg.add_attachment(data, maintype="application", subtype="pdf",
                        filename=Path(attachment).name)
-
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
-        s.ehlo()
-        s.starttls(context=ctx)
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
-    return msg["Message-ID"] or ""
+    return _deliver(msg)
 
 
 def send_batch(conn, leads, headers, ws, cap):
@@ -623,6 +702,24 @@ def load_workbook_or_exit():
     return wb, ws, headers
 
 
+def coverage(conn, leads):
+    """Confirm every captured website has a verified PDF before outreach runs."""
+    ok, missing = [], []
+    for lead in leads:
+        row = conn.execute(
+            "SELECT audit_pdf FROM outreach WHERE domain = ?", (lead.domain,)
+        ).fetchone()
+        good, detail = verify_pdf(row[0] if row else "")
+        if good:
+            belongs, expected = verify_pdf_belongs_to(row[0], lead.domain)
+            if belongs:
+                ok.append(lead.domain)
+                continue
+            detail = f"PDF is not this lead's (expected {expected})"
+        missing.append((lead.domain, detail))
+    return ok, missing
+
+
 def cmd_audit(args):
     conn = init_db()
     wb, ws, headers = load_workbook_or_exit()
@@ -662,6 +759,61 @@ def cmd_send(args):
     today = sent_today(conn)
     conn.close()
     log(f"\n[=] sent this run: {sent} | sent today: {today} | all time: {total}")
+
+
+def cmd_report(args):
+    conn = init_db()
+    wb, ws, headers = load_workbook_or_exit()
+    leads = read_leads(ws, headers)
+    have, missing = coverage(conn, leads)
+    sent_total = conn.execute("SELECT COUNT(*) FROM send_log").fetchone()[0]
+    today = sent_today(conn)
+    conn.close()
+
+    lines = [
+        f"Leads captured        : {len(leads)}",
+        f"With a verified audit : {len(have)}",
+        f"Awaiting an audit     : {len(missing)}",
+        f"Emails sent today     : {today}",
+        f"Emails sent all time  : {sent_total}",
+    ]
+    if missing:
+        lines.append("")
+        lines.append("Still awaiting an audit PDF:")
+        lines += [f"  {d:<34} {why}" for d, why in missing[:30]]
+        if len(missing) > 30:
+            lines.append(f"  ... and {len(missing) - 30} more")
+    body = "Growth Supply House - lead pipeline\n\n" + "\n".join(lines) + "\n"
+    log(body)
+
+    to = args.to or os.environ.get("REPORT_TO", "")
+    if not to:
+        log("[!] no recipient set (pass --to or set REPORT_TO) - summary printed only")
+        return
+    if not LIVE:
+        log(f"[!] DRY RUN - would email {MASTER_XLSX.name} to {to}")
+        return
+    if not (SMTP_USER and SMTP_PASS):
+        log("[!] SMTP_USER / SMTP_PASS not set - summary printed only")
+        return
+    send_report(to, f"Lead pipeline - {len(leads)} leads, {len(have)} audited", body, MASTER_XLSX)
+    log(f"[=] spreadsheet emailed to {to}")
+
+
+def cmd_verify(args):
+    """Report how many captured sites have a PDF that belongs to them."""
+    conn = init_db()
+    wb, ws, headers = load_workbook_or_exit()
+    leads = read_leads(ws, headers)
+    have, missing = coverage(conn, leads)
+    conn.close()
+    log(f"[=] {len(have)}/{len(leads)} leads have a verified audit PDF")
+    for d, why in missing[:30]:
+        log(f"      {d:<34} {why}")
+    if len(missing) > 30:
+        log(f"      ... and {len(missing) - 30} more")
+    if missing and args.strict:
+        raise SystemExit(f"{len(missing)} leads still have no verified audit PDF")
 
 
 def cmd_suppress(args):
@@ -706,6 +858,14 @@ if __name__ == "__main__":
     u.add_argument("emails", nargs="+")
     u.add_argument("--reason", default="manual")
     u.set_defaults(func=cmd_suppress)
+
+    r = sub.add_parser("report", help="email the spreadsheet + pipeline summary")
+    r.add_argument("--to", default="")
+    r.set_defaults(func=cmd_report)
+
+    v = sub.add_parser("verify", help="check every lead has a PDF that belongs to it")
+    v.add_argument("--strict", action="store_true")
+    v.set_defaults(func=cmd_verify)
 
     st = sub.add_parser("status", help="show counts")
     st.set_defaults(func=cmd_status)
