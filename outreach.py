@@ -55,6 +55,8 @@ FROM_NAME = os.environ.get("FROM_NAME", "Growth Supply House")
 REPLY_TO = os.environ.get("REPLY_TO", SMTP_USER)
 POSTAL_ADDRESS = os.environ.get("POSTAL_ADDRESS", "")
 SITE_URL = os.environ.get("SITE_URL", "https://www.growthsupplyhouse.com")
+# Pipeline reports go to the sending account itself unless told otherwise.
+REPORT_TO = os.environ.get("REPORT_TO") or SMTP_USER
 # Cap is per RUN, not per day: the outreach loop fires every 10 minutes and
 # sends up to this many each time. DAILY_CEILING is a backstop against a
 # runaway loop; 0 disables it.
@@ -983,7 +985,7 @@ def cmd_report(args):
     body = "Growth Supply House - lead pipeline\n\n" + "\n".join(lines) + "\n"
     log(body)
 
-    to = args.to or os.environ.get("REPORT_TO", "")
+    to = args.to or REPORT_TO
     if not to:
         log("[!] no recipient set (pass --to or set REPORT_TO) - summary printed only")
         return
