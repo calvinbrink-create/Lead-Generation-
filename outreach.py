@@ -522,6 +522,11 @@ SUBMIT_SELECTORS = (
     "button",
 )
 BROWSER_TIMEOUT = int(os.environ.get("BROWSER_TIMEOUT_MS", "90000"))
+# A download, if the tool offers one, starts within seconds of submitting.
+# Waiting the full navigation timeout for one that never comes costs a minute
+# and a half on every single site.
+DOWNLOAD_WAIT = int(os.environ.get("DOWNLOAD_WAIT_MS", "12000"))
+SETTLE_WAIT = int(os.environ.get("SETTLE_WAIT_MS", "25000"))
 
 
 def fetch_audit_browser(website, business):
@@ -551,11 +556,11 @@ def fetch_audit_browser(website, business):
 
             download = None
             try:
-                with page.expect_download(timeout=BROWSER_TIMEOUT) as dl:
+                with page.expect_download(timeout=DOWNLOAD_WAIT) as dl:
                     _click_submit(page, field)
                 download = dl.value
             except PWTimeout:
-                pass
+                pass          # no download offered - the usual case
             except Exception:
                 pass
 
@@ -564,7 +569,10 @@ def fetch_audit_browser(website, business):
                 if data[:5] == b"%PDF-":
                     return data, "browser download"
 
-            page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT)
+            try:
+                page.wait_for_load_state("networkidle", timeout=SETTLE_WAIT)
+            except Exception:
+                pass          # a live-updating report may never go idle
             page.wait_for_timeout(3000)
 
             # A link to the finished PDF.
