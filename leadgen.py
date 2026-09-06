@@ -767,7 +767,11 @@ def _open_book(path):
             wb = load_workbook(path)
             ws = wb.active
             header = [c.value for c in ws[1]] if ws.max_row >= 1 else []
-            if header == HEADERS:
+            # Trailing columns added by the outreach stage (Audit PDF, Audit
+            # Status, Emailed At, Email Status) are expected. Requiring an
+            # exact match here wiped every existing row each time outreach.py
+            # had extended the sheet.
+            if header[:len(HEADERS)] == HEADERS:
                 existing = {str(r[2]).lower() for r in ws.iter_rows(min_row=2, values_only=True) if r[2]}
                 return wb, ws, existing
             print(f"  [xlsx] {path.name} uses an old column layout - rewriting")
