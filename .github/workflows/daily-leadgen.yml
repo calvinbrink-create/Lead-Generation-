@@ -1,18 +1,21 @@
 name: Daily Lead Generation
 
 on:
+  # Restart net only. GitHub throttles high-frequency schedules hard, so the
+  # cron is not what gives the every-few-minutes cadence - the in-job loop
+  # below is. The cron just (re)starts that loop if it is not running.
   schedule:
-    # Every 10 minutes. GitHub's minimum for scheduled workflows is 5 minutes,
-    # and schedules are best-effort under load, so treat this as "roughly every
-    # 10-20 minutes" rather than a guarantee.
-    - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "How long this run should keep working (hours)"
+        required: false
+        default: "5"
 
 permissions:
   contents: write
 
-# One run at a time. Queue rather than cancel, so an in-flight run always gets
-# to commit the leads it has already paid for.
 concurrency:
   group: leadgen
   cancel-in-progress: false
@@ -20,7 +23,7 @@ concurrency:
 jobs:
   generate-leads:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 350
 
     steps:
       - name: Check out repo
@@ -35,34 +38,45 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run lead generator
-        run: python leadgen.py --queries 12 --max-seconds 420
-
-      - name: Commit results back to repo
+      - name: Scrape continuously
+        env:
+          RUN_HOURS: ${{ github.event.inputs.hours || '5' }}
         run: |
-          git config user.name "leadgen-bot"
+          set -u
+          git config user.name  "leadgen-bot"
           git config user.email "leadgen-bot@users.noreply.github.com"
-          git add output/ seen_domains.sqlite3
-          if git diff --cached --quiet; then
-            echo "No new leads this run - nothing to commit."
-            exit 0
-          fi
-          git commit -m "Leads: $(date -u '+%Y-%m-%d %H:%M') UTC"
-          # The branch can move between runs; rebase onto it before pushing.
-          for attempt in 1 2 3 4 5; do
-            if git push; then
-              echo "Pushed on attempt $attempt."
-              exit 0
+
+          SECONDS_TO_RUN=$(python -c "print(int(float('${RUN_HOURS}') * 3600))")
+          END=$(( $(date +%s) + SECONDS_TO_RUN ))
+          CYCLE=0
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            CYCLE=$((CYCLE + 1))
+            echo "::group::cycle $CYCLE ($(date -u '+%H:%M:%S') UTC)"
+            python leadgen.py --queries 12 --max-seconds 240 || echo "cycle failed, continuing"
+
+            git add output/ seen_domains.sqlite3 || true
+            if git diff --cached --quiet; then
+              echo "no new leads this cycle"
+            else
+              git commit -q -m "Leads: $(date -u '+%Y-%m-%d %H:%M') UTC (cycle $CYCLE)"
+              for attempt in 1 2 3; do
+                git push -q && break
+                echo "push rejected, rebasing onto origin"
+                git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
+                sleep $((attempt * 5))
+              done
             fi
-            echo "Push failed (attempt $attempt); rebasing onto origin and retrying."
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-            sleep $((attempt * 5))
+            echo "::endgroup::"
+
+            [ "$(date +%s)" -ge "$END" ] && break
+            sleep 60
           done
-          echo "::error::Could not push results after 5 attempts."
-          exit 1
+
+          echo "Loop finished after $CYCLE cycles."
 
       - name: Upload Excel as workflow artifact
-        if: hashFiles('output/*.xlsx') != ''
+        if: always() && hashFiles('output/*.xlsx') != ''
         uses: actions/upload-artifact@v4
         with:
           name: leads-${{ github.run_id }}
