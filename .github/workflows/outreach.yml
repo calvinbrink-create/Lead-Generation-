@@ -86,7 +86,10 @@ jobs:
             CYCLE_START=$(date +%s)
             echo "::group::cycle $CYCLE ($(date -u '+%H:%M:%S') UTC)"
 
-            python outreach.py audit --limit 12 || echo "audit stage had failures, continuing"
+            # 6 per cycle keeps a cycle inside the 10 minute window (browser
+            # capture runs about a minute per site) and still outruns the 4
+            # emails a cycle sends.
+            python outreach.py audit --limit 6 || echo "audit stage had failures, continuing"
             python outreach.py verify || true
             python outreach.py send --cap "${SEND_CAP_PER_RUN}" || echo "send stage had failures, continuing"
 
