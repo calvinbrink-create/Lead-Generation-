@@ -1,24 +1,26 @@
 name: Audit and Outreach
 
-# Runs every day: audit newly captured sites, confirm every one of them has a
-# PDF that belongs to it, email up to 4 owners, then send the operator the
-# spreadsheet. Sending only happens when OUTREACH_LIVE is set to 1.
+# Every 10 minutes: audit newly captured sites, check each PDF really belongs
+# to its business, email up to 4 owners, and commit the updated spreadsheet.
+#
+# The cadence comes from the in-job loop, not from cron - GitHub throttles
+# high-frequency schedules, so cron only restarts the loop.
 
 on:
   schedule:
-    - cron: "0 13 * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       live:
-        description: "Set to 1 to actually send email (otherwise dry run)"
+        description: "1 to actually send email, 0 for a dry run"
         required: false
         default: "0"
-      audit_limit:
-        description: "Max sites to audit this run"
+      hours:
+        description: "How long this run should keep working (hours)"
         required: false
-        default: "25"
+        default: "5"
       cap:
-        description: "Max outreach emails to send"
+        description: "Emails per 10-minute cycle"
         required: false
         default: "4"
 
@@ -32,11 +34,13 @@ concurrency:
 jobs:
   audit-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350
 
     env:
       OUTREACH_LIVE: ${{ github.event.inputs.live || '0' }}
-      AUDIT_BASE: https://audit.growthsupplyhouse.com
+      SEND_CAP_PER_RUN: ${{ github.event.inputs.cap || '4' }}
+      DAILY_CEILING: ${{ vars.DAILY_CEILING || '0' }}
+      AUDIT_BASE: ${{ vars.AUDIT_BASE || 'https://audit.growthsupplyhouse.com' }}
       AUDIT_ENDPOINT: ${{ vars.AUDIT_ENDPOINT }}
       AUDIT_METHOD: ${{ vars.AUDIT_METHOD || 'POST' }}
       AUDIT_FIELD: ${{ vars.AUDIT_FIELD || 'url' }}
@@ -62,39 +66,59 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run audits on captured sites
-        run: python outreach.py audit --limit "${{ github.event.inputs.audit_limit || '25' }}"
+      - name: Install browser for audit capture
+        run: python -m playwright install --with-deps chromium
 
-      - name: Verify every lead has a PDF that belongs to it
-        run: python outreach.py verify
-
-      - name: Send outreach
-        run: python outreach.py send --cap "${{ github.event.inputs.cap || '4' }}"
-
-      - name: Email the spreadsheet
-        if: always()
-        run: python outreach.py report
-
-      - name: Commit audits and updated spreadsheet
-        if: always()
+      - name: Audit and send on a 10 minute cycle
+        env:
+          RUN_HOURS: ${{ github.event.inputs.hours || '5' }}
         run: |
+          set -u
           git config user.name  "leadgen-bot"
           git config user.email "leadgen-bot@users.noreply.github.com"
-          git add output/ audits/ seen_domains.sqlite3 || true
-          if git diff --cached --quiet; then
-            echo "nothing changed"
-            exit 0
-          fi
-          git commit -q -m "Audits and outreach: $(date -u '+%Y-%m-%d %H:%M') UTC"
-          for attempt in 1 2 3; do
-            git push -q && exit 0
-            git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
-            sleep $((attempt * 5))
-          done
-          echo "::error::could not push"
-          exit 1
 
-      - name: Upload audits
+          SECONDS_TO_RUN=$(python -c "print(int(float('${RUN_HOURS}') * 3600))")
+          END=$(( $(date +%s) + SECONDS_TO_RUN ))
+          CYCLE=0
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            CYCLE=$((CYCLE + 1))
+            CYCLE_START=$(date +%s)
+            echo "::group::cycle $CYCLE ($(date -u '+%H:%M:%S') UTC)"
+
+            python outreach.py audit --limit 12 || echo "audit stage had failures, continuing"
+            python outreach.py verify || true
+            python outreach.py send --cap "${SEND_CAP_PER_RUN}" || echo "send stage had failures, continuing"
+
+            # Email the operator the spreadsheet once an hour.
+            if [ $(( CYCLE % 6 )) -eq 1 ]; then
+              python outreach.py report || true
+            fi
+
+            git add output/ audits/ seen_domains.sqlite3 || true
+            if git diff --cached --quiet; then
+              echo "nothing changed this cycle"
+            else
+              git commit -q -m "Audit + outreach: $(date -u '+%Y-%m-%d %H:%M') UTC (cycle $CYCLE)"
+              for attempt in 1 2 3; do
+                git push -q && break
+                git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
+                sleep $((attempt * 5))
+              done
+            fi
+            echo "::endgroup::"
+
+            [ "$(date +%s)" -ge "$END" ] && break
+
+            # Hold the 10 minute cadence regardless of how long the cycle took.
+            ELAPSED=$(( $(date +%s) - CYCLE_START ))
+            WAIT=$(( 600 - ELAPSED ))
+            [ "$WAIT" -gt 0 ] && sleep "$WAIT"
+          done
+
+          echo "Loop finished after $CYCLE cycles."
+
+      - name: Upload audits and spreadsheet
         if: always() && hashFiles('audits/*.pdf') != ''
         uses: actions/upload-artifact@v4
         with:
