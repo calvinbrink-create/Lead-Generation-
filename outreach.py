@@ -621,10 +621,13 @@ def fetch_audit(website, business, conn=None):
     tried = []
 
     cached = get_cached_endpoint(conn) if conn is not None else None
+    if cached and cached[0] == "NONE":
+        cached = None
+        _HTTP_PROBE_EXHAUSTED = True     # established by an earlier run
 
     if cached:
         order = [(cached, AUDIT_TIMEOUT)]
-    elif _HTTP_PROBE_EXHAUSTED:
+    elif _HTTP_PROBE_EXHAUSTED or os.environ.get("AUDIT_SKIP_HTTP") == "1":
         order = []                      # already proved there is nothing to find
     else:
         order = [(c, PROBE_TIMEOUT) for c in _candidates()]
@@ -646,7 +649,11 @@ def fetch_audit(website, business, conn=None):
 
     if not cached and order:
         _HTTP_PROBE_EXHAUSTED = True
-        log("           no HTTP endpoint answered; using the browser from here on")
+        if conn is not None:
+            # Remember across runs too, otherwise every run pays ~10 minutes
+            # re-proving there is no HTTP endpoint to find.
+            cache_endpoint(conn, "NONE", "", "")
+        log("           no HTTP endpoint answered; browser only from here on")
 
     if os.environ.get("AUDIT_NO_BROWSER") != "1":
         try:

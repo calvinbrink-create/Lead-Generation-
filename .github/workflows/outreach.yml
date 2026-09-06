@@ -44,6 +44,10 @@ jobs:
       AUDIT_ENDPOINT: ${{ vars.AUDIT_ENDPOINT }}
       AUDIT_METHOD: ${{ vars.AUDIT_METHOD || 'POST' }}
       AUDIT_FIELD: ${{ vars.AUDIT_FIELD || 'url' }}
+      # The audit tool is a page, not an API - two full runs proved no HTTP
+      # endpoint answers. Skip straight to the browser and save ~10 minutes a
+      # run. Set the repo variable to 0 if an API is ever added.
+      AUDIT_SKIP_HTTP: ${{ vars.AUDIT_SKIP_HTTP || '1' }}
       SMTP_HOST: ${{ vars.SMTP_HOST || 'smtp.gmail.com' }}
       SMTP_PORT: ${{ vars.SMTP_PORT || '587' }}
       SMTP_USER: ${{ secrets.SMTP_USER }}
