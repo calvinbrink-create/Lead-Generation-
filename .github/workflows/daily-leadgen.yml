@@ -1,0 +1,44 @@
+name: Daily Lead Generation
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  generate-leads:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run lead generator
+        run: python leadgen.py --target 200
+
+      - name: Commit results back to repo
+        run: |
+          git config user.name "leadgen-bot"
+          git config user.email "leadgen-bot@users.noreply.github.com"
+          git add output/ seen_domains.sqlite3
+          git diff --cached --quiet || git commit -m "Daily leads: $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Upload Excel as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: leads-${{ github.run_id }}
+          path: output/*.xlsx
+          retention-days: 30
