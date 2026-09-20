@@ -1,0 +1,48 @@
+name: AutoBPO Daily Discovery
+
+on:
+  schedule:
+    - cron: "0 12 * * *"   # 12:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: autobpo-discover
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: autobpo
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python main_discover.py
+        env:
+          # Reuses this repo's existing sales@growthsupplyhouse.com SMTP
+          # secrets (already wired for outreach.py at the repo root) - no
+          # separate Gmail setup needed for AutoBPO.
+          SMTP_HOST: ${{ vars.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ vars.SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          FROM_NAME: ${{ vars.FROM_NAME || 'Growth Supply House' }}
+      - name: Commit updated database
+        run: |
+          git config user.name "autobpo-bot"
+          git config user.email "autobpo-bot@users.noreply.github.com"
+          git add output/autobpo.db
+          git commit -m "auto: daily discovery run" || echo "nothing to commit"
+          for attempt in 1 2 3; do
+            git push -q && break
+            git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
+            sleep $((attempt * 5))
+          done

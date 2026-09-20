@@ -1,0 +1,6 @@
+{
+  "greenhouse": ["stripe", "figma", "airbnb"],
+  "lever": ["ro", "netlify"],
+  "ashby": ["ramp", "notion"],
+  "note": "This is a tiny starter seed for testing the fetch functions. Run discover_slugs.py to grow this into hundreds of real small/mid-size US/UK companies - big names like these are not real BPO prospects."
+}

@@ -1,0 +1,56 @@
+name: AutoBPO Inbox and Invoicing
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: autobpo-inbox
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: autobpo
+
+jobs:
+  inbox:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python main_inbox.py
+        env:
+          # Reuses this repo's existing sales@growthsupplyhouse.com SMTP
+          # secrets for both sending and IMAP reply-checking (config.py
+          # falls back to SMTP_USER/SMTP_PASS when IMAP_USER/IMAP_PASS
+          # aren't set - same Gmail app password works for both protocols).
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          FROM_NAME: ${{ vars.FROM_NAME || 'Growth Supply House' }}
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
+          PAYPAL_SECRET: ${{ secrets.PAYPAL_SECRET }}
+          # Deliberately NOT hardcoded to "live" (the brief this workflow was
+          # built from did that, which would send a real PayPal invoice to a
+          # real prospect the moment PAYPAL_CLIENT_ID/SECRET secrets exist,
+          # skipping the sandbox test the same brief calls for). Defaults to
+          # sandbox; set the PAYPAL_MODE repo VARIABLE (not secret) to "live"
+          # only after a sandbox invoice has been sent and paid successfully.
+          PAYPAL_MODE: ${{ vars.PAYPAL_MODE || 'sandbox' }}
+      - name: Commit updated database
+        run: |
+          git config user.name "autobpo-bot"
+          git config user.email "autobpo-bot@users.noreply.github.com"
+          git add output/autobpo.db
+          git commit -m "auto: inbox + invoicing run" || echo "nothing to commit"
+          for attempt in 1 2 3; do
+            git push -q && break
+            git pull --rebase --autostash -q origin "${GITHUB_REF_NAME}" || true
+            sleep $((attempt * 5))
+          done
